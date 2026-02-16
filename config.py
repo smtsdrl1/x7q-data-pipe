@@ -119,6 +119,15 @@ LOG_FILE = "logs/trading.log"
 LOG_FORMAT = "%(asctime)s | %(name)s | %(levelname)s | %(message)s"
 
 # ============================================
+# BİLDİRİM VE JOURNAL AYARLARI
+# ============================================
+NOTIFICATION_RETRY_COUNT = 3           # Başarısız bildirim yeniden deneme sayısı
+NOTIFICATION_RETRY_DELAY = 2           # Yeniden deneme arası bekleme (saniye)
+PERIODIC_REPORT_INTERVAL = 900         # Periyodik rapor aralığı (saniye) — 15dk
+PRICE_SNAPSHOT_INTERVAL = 30           # Fiyat snapshot aralığı (kontrol sayısı)
+JOURNAL_MAX_SNAPSHOTS = 100            # Trade başına max fiyat snapshot
+
+# ============================================
 # GENEL AYARLAR
 # ============================================
 SCAN_INTERVAL_SECONDS = 10    # Her kaç saniyede bir tarama yapılsın
