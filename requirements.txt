@@ -1,6 +1,6 @@
 ccxt==4.4.26
 pandas==2.2.3
-pandas_ta==0.3.14b1
+pandas_ta>=0.3.14b1
 numpy==1.26.4
 python-telegram-bot==21.8
 python-dotenv==1.0.1
