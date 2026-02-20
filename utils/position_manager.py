@@ -9,7 +9,7 @@ from utils.logger import setup_logger
 from utils.risk_manager import RiskManager, TradeRecord
 from config import (
     PARTIAL_TP_ENABLED, PARTIAL_TP1_RATIO, PARTIAL_TP1_MULTIPLIER,
-    BREAKEVEN_AFTER_TP1, PYRAMID_ENABLED,
+    BREAKEVEN_AFTER_TP1, PYRAMID_ENABLED, KELLY_SIZING_ENABLED,
 )
 
 logger = setup_logger("PositionManager")
@@ -58,7 +58,12 @@ class PositionManager:
 
         stop_loss = self.risk_manager.calculate_stop_loss(entry_price, atr, side)
         take_profit = self.risk_manager.calculate_take_profit(entry_price, stop_loss, side)
-        quantity = self.risk_manager.calculate_position_size(entry_price, stop_loss)
+
+        # Kelly Criterion pozisyon boyutlama (yeterli geçmiş yoksa standarda düşer)
+        if KELLY_SIZING_ENABLED:
+            quantity = self.risk_manager.get_kelly_size_from_history(entry_price, stop_loss)
+        else:
+            quantity = self.risk_manager.calculate_position_size(entry_price, stop_loss)
 
         if quantity <= 0:
             logger.warning(f"Geçersiz pozisyon boyutu: {symbol}")

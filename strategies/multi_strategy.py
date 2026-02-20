@@ -21,10 +21,13 @@ from utils.cvd import calculate_cvd, get_cvd_score_boost
 from utils.market_structure import analyze_market_structure
 from utils.market_regime import market_regime_detector
 from utils.session_killzone import is_tradeable_session, session_score_multiplier
+from utils.economic_calendar import check_news_kill_zone
+from utils.derivatives import get_derivatives_score_boost
 from config import (
     SIGNAL_BUY_THRESHOLD, SIGNAL_SELL_THRESHOLD, MIN_STRATEGIES_AGREE,
     TREND_FILTER_ENABLED, FVG_FIBONACCI_WEIGHT,
     SESSION_FILTER_ENABLED, SESSION_MIN_QUALITY, REGIME_DETECTION_ENABLED,
+    DERIVATIVES_ENABLED,
 )
 
 logger = setup_logger("MultiStrategy")
@@ -49,10 +52,12 @@ class MultiStrategyEngine:
 
     def analyze(self, df: pd.DataFrame, symbol: str,
                 trend_context: dict = None,
-                backtest_dt=None) -> dict:
+                backtest_dt=None,
+                derivatives_context: dict = None) -> dict:
         """
         Tüm stratejileri çalıştır ve composite sinyal üret.
-        trend_context: {"trend": "BULLISH"|"BEARISH"|"NEUTRAL", ...} — 1h trend bilgisi
+        trend_context: {"trend": "BULLISH"|"BEARISH"|"NEUTRAL", ...} – 1h trend bilgisi
+        derivatives_context: {"oi": {...}, "fr": {...}} – önceden çekilmiş OI/FR verisi
         """
         if df.empty or len(df) < 60:
             return {
@@ -118,13 +123,43 @@ class MultiStrategyEngine:
                 final_signal = SignalType.NEUTRAL
         # ──────────────────────────────────────────────────────────
 
-        # ── CVD ANALİZİ ───────────────────────────────────────────
+        # ── CVD ANALİZİ ──────────────────────────────────────────────────────
         cvd_data = calculate_cvd(df)
         cvd_boost = 0
         if final_signal == SignalType.BUY:
             cvd_boost = get_cvd_score_boost(cvd_data, "buy")
         elif final_signal == SignalType.SELL:
             cvd_boost = get_cvd_score_boost(cvd_data, "sell")
+        # ────────────────────────────────────────────────────────────────────
+
+        # ── DERIVATIVES (OI + FUNDING RATE) SKOR BOOST ──────────────────────
+        deriv_boost = 0.0
+        deriv_data = {}
+        if DERIVATIVES_ENABLED and derivatives_context and final_signal != SignalType.NEUTRAL:
+            oi_data = derivatives_context.get("oi", {})
+            fr_data = derivatives_context.get("fr", {})
+            if oi_data or fr_data:
+                side = "buy" if final_signal == SignalType.BUY else "sell"
+                deriv_boost = get_derivatives_score_boost(oi_data, fr_data, side)
+                deriv_data = {"oi": oi_data, "fr": fr_data, "boost": deriv_boost}
+                if deriv_boost != 0:
+                    logger.debug(
+                        f"📈 {symbol} Derivatives boost: {deriv_boost:+.3f} "
+                        f"(OI={oi_data.get('oi_value', 0):.0f}, "
+                        f"FR={fr_data.get('funding_rate', 0):.4f})"
+                    )
+        # ────────────────────────────────────────────────────────────────────
+
+        # ── EKONOMİK TAKVİM (NEWS KILL ZONE) ────────────────────────────────
+        news_kill_data = check_news_kill_zone(minutes_before=30, minutes_after=30)
+        news_filtered = False
+        if news_kill_data.get("in_kill_zone") and final_signal != SignalType.NEUTRAL:
+            event_name = news_kill_data.get("nearest_event", {}).get("name", "Yüksek etkili haber")
+            logger.info(
+                f"📰 {symbol} Haber Kill Zone: {event_name} → sinyal engellendi"
+            )
+            final_signal = SignalType.NEUTRAL
+            news_filtered = True
         # ──────────────────────────────────────────────────────────
 
         # ── MARKET STRUCTURE ANALİZİ ──────────────────────────────
@@ -178,6 +213,10 @@ class MultiStrategyEngine:
             "cvd_boost": cvd_boost,
             "ms_data": ms_data,
             "ms_boost": ms_boost,
+            "deriv_data": deriv_data,
+            "deriv_boost": deriv_boost,
+            "news_kill_data": news_kill_data,
+            "news_filtered": news_filtered,
         }
 
         if final_signal != SignalType.NEUTRAL:

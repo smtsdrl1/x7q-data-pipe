@@ -12,6 +12,8 @@ from utils.risk_manager import RiskManager, TradeRecord
 from utils.position_manager import PositionManager
 from utils.price_verifier import PriceVerifier
 from utils.signal_tracker import SignalTracker
+from utils.circuit_breaker import AdvancedCircuitBreaker
+from utils.derivatives import get_open_interest, get_funding_rate
 from utils.logger import setup_logger
 from utils.helpers import format_currency, format_pct
 from strategies.multi_strategy import MultiStrategyEngine
@@ -20,6 +22,7 @@ from config import (
     TRADING_PAIRS, PRIMARY_TIMEFRAME, OHLCV_LIMIT,
     SCAN_INTERVAL_SECONDS, MAX_CONCURRENT_POSITIONS,
     SIGNAL_COOLDOWN_MINUTES, SIGNAL_SCORE_OVERRIDE_DELTA,
+    DERIVATIVES_ENABLED,
 )
 
 logger = setup_logger("PaperTrading")
@@ -50,6 +53,8 @@ class PaperTradingEngine:
         self.start_time = None
         self._telegram_callback = None
         self._signal_id_map: dict[str, str] = {}  # symbol → signal_id
+        self.circuit_breaker = AdvancedCircuitBreaker()
+        self._price_history: dict[str, list] = {}  # correlation için fiyat geçmişi
         # Sinyal dedup: {symbol: (direction, composite_score, timestamp)}
         # Aynı pair için cooldown süresi içinde tekrar sinyal üretilmesini engeller.
         # Pozisyon açıkken de engeller (position_manager bunu zaten sağlar ama
@@ -177,6 +182,12 @@ class PaperTradingEngine:
                 logger.warning(f"Trading durdu: {reason}")
             return
 
+        # Circuit Breaker kontrolü
+        cb_ok, cb_reason = self.circuit_breaker.check()
+        if not cb_ok:
+            logger.warning(f"Circuit breaker aktif: {cb_reason}")
+            return
+
         for pair in pairs_to_scan:
             try:
                 # 1) OHLCV verisini çek (WebSocket cache öncelikli)
@@ -184,11 +195,26 @@ class PaperTradingEngine:
                 if df.empty or len(df) < 60:
                     continue
 
+                # Fiyat geçmişini güncelle (correlation için)
+                self._price_history[pair] = df["close"].tolist()
+
                 # 2) 1h trend bağlamı çek
                 trend_ctx = await self.data_fetcher.fetch_trend_context(pair)
 
-                # 3) Strateji analizi (trend filtresiyle)
-                analysis = self.strategy_engine.analyze(df, pair, trend_context=trend_ctx)
+                # 3) Derivatives bağlamı çek (OI + Funding Rate)
+                derivatives_ctx = None
+                if DERIVATIVES_ENABLED:
+                    try:
+                        oi_data = await get_open_interest(pair)
+                        fr_data = await get_funding_rate(pair)
+                        derivatives_ctx = {"oi": oi_data, "fr": fr_data}
+                    except Exception as _de:
+                        logger.debug(f"Derivatives veri hatası ({pair}): {_de}")
+
+                # 4) Strateji analizi (trend filtresiyle + derivatives)
+                analysis = self.strategy_engine.analyze(
+                    df, pair, trend_context=trend_ctx, derivatives_context=derivatives_ctx
+                )
 
                 # Trend filtresiyle engellendi mi?
                 if analysis.get("trend_filtered"):
@@ -266,6 +292,22 @@ class PaperTradingEngine:
                 real_price = verification["real_price"]
                 atr = analysis.get("atr", 0)
 
+                # Korelasyon kontrolü (açık pozisyonlarla yüksek korelasyon varsa atla)
+                open_symbols = list(self.position_manager.open_positions.keys())
+                if open_symbols:
+                    can_open, max_corr = self.risk_manager.check_correlation(
+                        pair, open_symbols, self._price_history
+                    )
+                    if not can_open:
+                        logger.debug(
+                            f"[{pair}] Korelasyon filtresi: max_corr={max_corr:.2f} → atlandı"
+                        )
+                        self.signal_tracker.reject_signal(
+                            signal.signal_id,
+                            f"Yüksek korelasyon ({max_corr:.2f})"
+                        )
+                        continue
+
                 position = self.position_manager.open_position(pair, "buy", real_price, atr)
                 if not position:
                     self.signal_tracker.reject_signal(
@@ -337,8 +379,25 @@ class PaperTradingEngine:
                     # Pozisyon çıkış kontrolü
                     result = self.position_manager.check_exits(symbol, current_price)
                     if result and "error" not in result:
+                        # ── Parsiyel TP1 ─────────────────────────────────────
+                        if result.get("type") == "partial_tp1":
+                            pnl_partial = (result["price"] - self.position_manager.open_positions.get(symbol, type("", (), {"entry_price": result["price"]})()).entry_price) * result["closed_qty"] if symbol in self.position_manager.open_positions else 0
+                            await self.notify(
+                                f"✂️ <b>PARSİYEL TP1</b> — {symbol}\n"
+                                f"{'─' * 30}\n"
+                                f"  Kapatılan: {result['closed_qty']:.6f} lot\n"
+                                f"  Kalan: {result['remaining_qty']:.6f} lot\n"
+                                f"  Fiyat: {format_currency(result['price'])}\n"
+                                f"  Yeni SL (Breakeven): {format_currency(result['new_stop'])}"
+                            )
+                            continue  # Pozisyon hâlâ açık, izlemeye devam
+                        # ─────────────────────────────────────────────────────
+
                         # Çıkış fiyatını da doğrula
                         exit_verification = await self.price_verifier.verify_price(symbol)
+
+                        # Circuit breaker'a trade sonucunu kaydet
+                        self.circuit_breaker.record_trade_result(result.get("pnl_pct", 0.0) / 100)
 
                         # Signal tracker güncelle
                         signal = self.signal_tracker.close_signal(
